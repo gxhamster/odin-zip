@@ -1,8 +1,47 @@
 package zip
 
+import "core:mem"
+import "core:os"
 import "core:time"
 import "core:time/datetime"
 import "core:strings"
+
+
+open_from_path :: proc(path: string, mode: os.File_Flags, allocator := context.allocator) -> (archive: ZipArchive, err: Error) {
+	if !os.exists(path) {
+		return archive, .OS_Error
+	}
+	file, file_err := os.open(path, mode)
+	if file_err != os.ERROR_NONE {
+		return archive, .OS_Error
+	}
+
+	defer os.close(file)
+
+	archive.file = file
+	archive.allocator = allocator
+
+	file_size, file_size_err := os.file_size(file)
+	if file_size_err != os.ERROR_NONE {
+		return archive, .OS_Error
+	}
+
+	if (file_size < size_of(_EocdHdr)) {
+		return archive, .Corrupted_Data
+	}
+
+	reader : ^Reader = new(Reader, archive.allocator)
+	file_data, file_read_err := os.read_entire_file_from_file(file, archive.allocator)
+	if file_read_err != nil {
+		return archive, .OS_Error
+	}
+	reader_init(reader, file_data)
+	archive.reader = reader
+
+	read_metadata(&archive) or_return
+
+	return archive, .None
+}
 
 
 find_eocd_signature :: proc(archive: ^ZipArchive) -> (offset: i64, ok: bool) {
