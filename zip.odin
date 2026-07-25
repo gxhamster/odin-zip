@@ -1,5 +1,10 @@
 package zip
 
+import "core:time"
+import "core:time/datetime"
+import "core:strings"
+
+
 find_eocd_signature :: proc(archive: ^ZipArchive) -> (offset: i64, ok: bool) {
 	// First try to search a smaller window, if not possible try the
 	// largest possible size
@@ -31,4 +36,215 @@ find_eocd_signature :: proc(archive: ^ZipArchive) -> (offset: i64, ok: bool) {
 
 	archive.reader.offset = restore_seek_pos
 	return -1, false
+}
+
+// Reads all the directory information inside the zip archive and collect the entries
+read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
+	// Properly find the Zip64 eocd and locator and sets the field in struct
+	eocd_offset, ok := find_eocd_signature(archive)
+	if !ok {
+		return .EOCD_Signature_Not_Found
+	}
+
+	reader_seek(archive.reader, eocd_offset) or_return
+	raw_eocd_hdr := reader_read_value(archive.reader, _EocdHdr) or_return
+
+	// Archives spanning different disks not supported. This aint 1970
+	if raw_eocd_hdr.disk_number != raw_eocd_hdr.starting_disk {
+		return .Not_Supported
+	}
+
+	if (raw_eocd_hdr.comment_length > 0) {
+		// TODO: Detect if a proper utf-8 and do the neccesary
+		archive.comment = reader_read_string(archive.reader, i64(raw_eocd_hdr.comment_length)) or_return
+	}
+
+	if raw_eocd_hdr.offset_to_central_directory_start > max(u32le) {
+		return .Invalid_Offset
+	}
+
+	num_entries := i64(raw_eocd_hdr.total_central_records)
+
+	// Check if this zip archive could be a ZIP64 type
+	if raw_eocd_hdr.offset_to_central_directory_start == 0xFFFFFFFF || raw_eocd_hdr.total_central_records == 0xFFFF {
+		// Find the zip64 locator located before the EOCD
+		total_file_size := reader_size(archive.reader)
+		locator_position := total_file_size - size_of(_EocdHdr) - size_of(_Zip64_Locator)
+		locator_hdr := reader_read_value(archive.reader, _Zip64_Locator) or_return
+		if locator_hdr.magic == u32le(Magic.ZIP64_LOCATOR) {
+			// Find the zip64 EOCD before the locator
+			reader_seek(archive.reader, i64(locator_hdr.offset_eocd)) or_return
+			zip64_eocd := reader_read_value(archive.reader, _Zip64EocdHdr) or_return
+			if zip64_eocd.magic == u32le(Magic.ZIP64_EOCD) {
+				reader_seek(archive.reader, i64(zip64_eocd.offset_cd))
+				num_entries = i64(zip64_eocd.entries_total)
+			}
+		}
+	}
+
+	reader_seek(archive.reader, i64(raw_eocd_hdr.offset_to_central_directory_start)) or_return
+
+	for i in 0 ..< num_entries {
+		// Read all the central directory entries
+		cd_hdr := reader_read_value(archive.reader, _CdHdr) or_break
+		if cd_hdr.magic != u32le(Magic.CDH) do break
+		file_name_len := i64(cd_hdr.file_name_length)
+		// Note: Need to check if odin strings need to be checked for valid utf-8
+		file_name := reader_read_string(archive.reader, file_name_len) or_break
+
+		entry: ZipEntry
+		entry.name = file_name
+		entry.compressed_size = i64(cd_hdr.compressed_size)
+		entry.uncompressed_size = i64(cd_hdr.uncompressed_size)
+		entry.local_offset = u64(cd_hdr.local_hdr_offset)
+		entry.crc32 = u32(cd_hdr.crc)
+		entry.method = cd_hdr.compression_method
+		mod_datetime, mod_datetime_err := datetime.components_to_datetime(
+			cd_hdr.last_modified_date.year,
+			cd_hdr.last_modified_date.month,
+			cd_hdr.last_modified_date.day,
+			cd_hdr.last_modified_time.hour,
+			cd_hdr.last_modified_time.minute,
+			cd_hdr.last_modified_time.second,
+		)
+		if mod_datetime_err != .None {
+			break
+		} else {
+			entry.modified_datetime = mod_datetime
+		}
+
+		// note: If these fields are at max good indicator that ZIP64 format is being used
+		is_zip64 :=
+			cd_hdr.compressed_size == U32_MAX ||
+			cd_hdr.uncompressed_size == U32_MAX ||
+			cd_hdr.local_hdr_offset == U32_MAX
+
+		if is_zip64 {
+
+			// 4.5 Extensible data fields
+			// header1+data1 + header2+data2
+			// Each header MUST consist of:
+			//      Header ID - 2 bytes
+			//      Data Size - 2 bytes
+
+			Extra_Hdr :: struct {
+				id:   u16le,
+				size: u16le,
+			}
+
+			Extra_Zip64 :: struct #packed {
+				original_size:     i64,
+				compressed_size:   i64,
+				hdr_offset:        u64,
+				disk_start_number: u32,
+			}
+
+			extra_field_len := i64(cd_hdr.extra_field_length)
+			extra_field_end_offset := archive.reader.offset + extra_field_len
+
+			for reader_available(archive.reader) > 4 && reader_cursor(archive.reader) < extra_field_end_offset {
+				extra_field_hdr := reader_read_value(archive.reader, Extra_Hdr) or_break
+
+				switch extra_field_hdr.id {
+				case 0x0001:
+					// Zip64 4.5.3
+					{
+						zip64_extra := reader_read_value(archive.reader, Extra_Zip64) or_break
+						if cd_hdr.compressed_size == U32_MAX {
+							entry.compressed_size = zip64_extra.compressed_size
+						}
+						if cd_hdr.uncompressed_size == U32_MAX {
+							entry.uncompressed_size = zip64_extra.original_size
+						}
+						if cd_hdr.local_hdr_offset == U32_MAX {
+							entry.local_offset = zip64_extra.hdr_offset
+						}
+					}
+				case 0x000a:
+					// NTFS 4.5.5
+					{
+						NTFS_TAG1 :: 0x0001
+						NTFS_TAG1_SIZE :: 24
+						Extra_NTFS_Tag1 :: struct #packed {
+							tag:   u16le,
+							size:  u16le,
+							mtime: u64le,
+							atime: u64le,
+							ctime: u64le,
+						}
+						// skip the reserved
+						reader_skip(archive.reader, 4)
+						ntfs_extra := reader_read_value(archive.reader, Extra_NTFS_Tag1) or_break
+						if ntfs_extra.tag == NTFS_TAG1 && ntfs_extra.size == NTFS_TAG1_SIZE {
+							WINDOWS_TICKS_PER_SEC :: 1e7
+							secs := i64(ntfs_extra.mtime) / WINDOWS_TICKS_PER_SEC
+							nsecs := (1e9 / WINDOWS_TICKS_PER_SEC) * (i64(ntfs_extra.mtime) % WINDOWS_TICKS_PER_SEC)
+							epoch, epoch_err := datetime.components_to_datetime(1601, 1, 1, 0, 0, 0, 0)
+							assert(epoch_err == .None, "cannot convert windows epoch to datetime")
+
+							epoch_time, epoch_time_ok := time.datetime_to_time(epoch)
+							assert(epoch_time_ok, "cannot convert epoch to Time")
+
+							modtime_duration := time.Duration(nsecs)
+							actual_modtime := time.time_add(epoch_time, modtime_duration)
+							modtime_to_datetime, modtime_to_datetime_ok := time.time_to_datetime(actual_modtime)
+							if !modtime_to_datetime_ok {
+								return .Datetime_Error
+							}
+							entry.modified_datetime = modtime_to_datetime
+						}
+					}
+				case 0x000d:
+					// UNIX
+					{
+						Extra_Unix :: struct #packed {
+							atime: u32le,
+							mtime: u32le,
+							uid:   u16le,
+							gid:   u16le,
+						}
+						variable_field_size := i64(extra_field_hdr.size) - size_of(Extra_Unix)
+						unix_extra := reader_read_value(archive.reader, Extra_Unix) or_break
+						// skip the variable field
+						reader_skip(archive.reader, variable_field_size)
+						mtime_unix := time.unix(i64(unix_extra.mtime), 0)
+						unix_datetime, unix_datetime_err := time.time_to_datetime(mtime_unix)
+						if !unix_datetime_err {
+							return .Datetime_Error
+						}
+						entry.modified_datetime = unix_datetime
+					}
+				case:
+					// There are others too (just ignore those)
+					reader_skip(archive.reader, i64(extra_field_hdr.size))
+				}
+
+			}
+
+		}
+
+		is_dir := strings.ends_with(file_name, "/") || strings.ends_with(file_name, "\\")
+		// If cannot determine from the path alone do a platform-dependent flags checks
+		if !is_dir {
+			// See 4.4.2
+			host_system := i64(cd_hdr.version >> 8)
+			if host_system == i64(Platform.MS_DOS) || host_system == i64(Platform.WINDOWS) {
+				if (cd_hdr.external_attrib & 0x10) != 0 {
+					is_dir = true
+				}
+			} else if host_system == i64(Platform.UNIX) {
+				if ((cd_hdr.external_attrib >> 16) & 0x4000) != 0 {
+					is_dir = true
+				}
+			}
+		}
+
+		entry.is_directory = is_dir
+		entry.is_encrypted = (cd_hdr.flag & 0x1) != 0
+
+		append(&archive.entries, entry)
+
+	}
+
+	return .None
 }

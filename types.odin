@@ -55,6 +55,13 @@ Magic :: enum u32le {
 	CDH           = 0x02014b50,
 }
 
+Platform :: enum i64 {
+	MS_DOS  = 0,
+	UNIX    = 3,
+	WINDOWS = 10,
+}
+
+
 // Private types. Used only for reading the raw binary headers according
 // to the spec
 
@@ -71,3 +78,73 @@ _EocdHdr :: struct #packed {
 	comment_length:                    u16le, // .ZIP file comment length
 }
 
+@(private)
+_Zip64EocdHdr :: struct #packed {
+	magic:                   u32le, // zip64 end of central dir signature
+	size:                    i64le, // size of zip64 end of central directory record
+	version:                 u16le, // version made by
+	version_needed:          u16le, // version needed to extract
+	disk_num:                u32le, // number of this disk
+	disk_start:              u32le, //  number of the disk with the start of the central directory
+	entries_count_this_disk: i64le, // total number of entries in the central directory on this disk
+	entries_total:           i64le, // total number of entries in the central directory
+	size_cd:                 i64le, // size of the central directory
+	offset_cd:               i64le, // offset of start of central directory with respect to the starting disk number
+}
+
+@(private)
+_Zip64_Locator :: struct #packed {
+	magic:       u32le, // zip64 end of central dir locator signature
+	disk_start:  u32le, // number of the disk with the start of the zip64 end of central directory
+	offset_eocd: u64le, // relative offset of the zip64 end of central directory record
+	total_disks: u32le, // total number of disks
+}
+
+MsDosTime :: bit_field u16le {
+	second: u32le | 5,
+	minute: u32le | 6,
+	hour:   u32le | 5,
+}
+
+MsDosDate :: bit_field u16le {
+	day:   u32le | 5,
+	month: u32le | 4,
+	year:  u32le | 7,
+}
+
+
+@(private)
+_CdHdr :: struct #packed {
+	magic:               u32le,
+	version:             u16le,
+	version_needed:      u16le,
+	flag:                u16le,
+	compression_method:  CompressioMethod,
+	last_modified_time:  MsDosTime,
+	last_modified_date:  MsDosDate,
+	crc:                 u32le,
+	compressed_size:     u32le,
+	uncompressed_size:   u32le,
+	file_name_length:    u16le,
+	extra_field_length:  u16le,
+	file_comment_length: u16le,
+	file_start_disk:     u16le,
+	internal_attrib:     u16le,
+	external_attrib:     u32le,
+	local_hdr_offset:    u32le,
+}
+
+@(private)
+ExtraFieldType :: enum {
+	Zip64 = 0x0001,
+}
+
+@(private)
+ExtraField :: struct {
+	id:   ExtraFieldType,
+	size: u64,
+	data: []u8,
+}
+
+U32_MAX :: 0xFFFFFFFF
+U16_MAX :: 0xFFFF
