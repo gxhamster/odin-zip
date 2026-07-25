@@ -47,3 +47,27 @@ Error :: enum {
 	EOCD_Signature_Not_Found,
 	Invalid_Comment_Length,
 }
+
+Magic :: enum u32le {
+	EOCD          = 0x06054b50,
+	ZIP64_EOCD    = 0x06064B50,
+	ZIP64_LOCATOR = 0x07064B50,
+	CDH           = 0x02014b50,
+}
+
+// Private types. Used only for reading the raw binary headers according
+// to the spec
+
+
+@(private)
+_EocdHdr :: struct #packed {
+	magic:                             u32le, // end of central dir signature
+	disk_number:                       u16le, // number of this disk
+	starting_disk:                     u16le, // number of the disk with the start of the central directory
+	total_central_records_disk:        u16le, // total number of entries in the central directory on this disk
+	total_central_records:             u16le, // total number of entries in the central directory
+	total_size_central_directory:      u32le, // size of the central directory
+	offset_to_central_directory_start: u32le, // offset of start of central directory with respect to  the starting disk number
+	comment_length:                    u16le, // .ZIP file comment length
+}
+
