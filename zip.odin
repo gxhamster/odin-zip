@@ -1,13 +1,21 @@
 package zip
 
+import "core:bytes"
+import "core:compress/zlib"
 import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:time"
 import "core:time/datetime"
-import "core:strings"
 
-
-open_from_path :: proc(path: string, mode: os.File_Flags, allocator := context.allocator) -> (archive: ZipArchive, err: Error) {
+open_from_path :: proc(
+	path: string,
+	mode: os.File_Flags,
+	allocator := context.allocator,
+) -> (
+	archive: ZipArchive,
+	err: Error,
+) {
 	if !os.exists(path) {
 		return archive, .OS_Error
 	}
@@ -30,7 +38,7 @@ open_from_path :: proc(path: string, mode: os.File_Flags, allocator := context.a
 		return archive, .Corrupted_Data
 	}
 
-	reader : ^Reader = new(Reader, archive.allocator)
+	reader: ^Reader = new(Reader, archive.allocator)
 	file_data, file_read_err := os.read_entire_file_from_file(file, archive.allocator)
 	if file_read_err != nil {
 		return archive, .OS_Error
@@ -286,4 +294,96 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 	}
 
 	return .None
+}
+
+stat_by_name :: proc(archive: ^ZipArchive, name: string) -> (entry: ZipEntry, idx: u64, err: Error) {
+	for _entry, i in archive.entries {
+		if _entry.name == name {
+			return _entry, u64(i), .None
+		}
+	}
+
+	return entry, idx, .Entry_Not_Found
+}
+
+stat_by_index :: proc(archive: ^ZipArchive, index: u64) -> (entry: ZipEntry, err: Error) {
+	if int(index) > len(archive.entries) - 1 {
+		return entry, .Entry_Not_Found
+	}
+
+	return archive.entries[index], .None
+}
+
+stat :: proc {
+	stat_by_name,
+	stat_by_index,
+}
+
+
+deflate_decompressor :: proc(input: []u8, allocator: mem.Allocator) -> (out: bytes.Buffer, err: Error) {
+	out_buffer: bytes.Buffer
+	bytes.buffer_init_allocator(&out_buffer, 0, len(input), allocator)
+	zlib_err := zlib.inflate_from_byte_array_raw(input, &out_buffer)
+	if zlib_err != {} {
+		return out, .Deflate_Error
+	}
+
+	return out_buffer, .None
+}
+
+extract_entry_to_reader :: proc{extract_entry_to_reader_by_name, extract_entry_to_reader_by_index}
+
+extract_entry_to_reader_by_name :: proc(archive: ^ZipArchive, entry_name: string) -> (r: ^Reader, err: Error) {
+	_, entry_idx := stat_by_name(archive, entry_name) or_return
+	return extract_entry_to_reader_by_index(archive, entry_idx)
+}
+
+extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -> (r: ^Reader, err: Error) {
+	target_entry := stat_by_index(archive, entry_idx) or_return
+	reader_seek(archive.reader, i64(target_entry.local_offset)) or_return
+	local_file_header := reader_read_value(archive.reader, _LfHdr) or_return
+	if local_file_header.magic != u32le(Magic.LFH) {
+		return r, .Corrupted_Data
+	}
+
+	if target_entry.is_encrypted {
+		// Refer to 6.1.3
+		// 12 bytes as the encryption header
+		// APPENDIX E - AE-x encryption marker
+		unimplemented("implement AEX decryption")
+	}
+
+	// Ignore the file name and extra fields of the local header
+	// Place the cursor right at start of file data
+	skip_bytes := i64(local_file_header.file_name_len) + i64(local_file_header.extra_field_len)
+	reader_skip(archive.reader, skip_bytes) or_return
+	switch target_entry.method {
+	case .DEFLATE:
+		{
+			assert(target_entry.compressed_size < target_entry.uncompressed_size)
+			file_data := reader_read_array(archive.reader, u8, target_entry.compressed_size) or_return
+			file_data_cloned := make([]u8, len(file_data), archive.allocator)
+			copy(file_data_cloned, file_data)
+
+			out_buffer := deflate_decompressor(file_data_cloned, archive.allocator) or_return
+			r.data = out_buffer.buf[:]
+			
+			return r, .None
+		}
+	case .STORE:
+		{
+			assert(target_entry.compressed_size == target_entry.uncompressed_size)
+			file_data := reader_read_array(archive.reader, u8, target_entry.uncompressed_size) or_return
+			file_data_cloned := make([]u8, len(file_data), archive.allocator)
+			copy(file_data_cloned, file_data)
+			r.data = file_data_cloned
+
+			return r, .None
+		}
+	case .AEX:
+		unreachable()
+	}
+
+
+	return r, .Not_Supported
 }

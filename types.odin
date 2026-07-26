@@ -39,6 +39,8 @@ Error :: enum {
 	Corrupted_Data,
 	Not_Supported,
 	Datetime_Error,
+	Entry_Not_Found,
+	Deflate_Error,
 
 	// Reader Errors
 	Short_Read,
@@ -53,6 +55,7 @@ Magic :: enum u32le {
 	ZIP64_EOCD    = 0x06064B50,
 	ZIP64_LOCATOR = 0x07064B50,
 	CDH           = 0x02014b50,
+	LFH           = 0x04034b50,
 }
 
 Platform :: enum i64 {
@@ -98,6 +101,21 @@ _Zip64_Locator :: struct #packed {
 	disk_start:  u32le, // number of the disk with the start of the zip64 end of central directory
 	offset_eocd: u64le, // relative offset of the zip64 end of central directory record
 	total_disks: u32le, // total number of disks
+}
+
+@(private)
+_LfHdr :: struct #packed {
+	magic:           u32le,
+	version_needed:  u16le,
+	flags:           u16le,
+	comp_method:     CompressioMethod,
+	mod_time:        MsDosTime,
+	mod_date:        MsDosDate,
+	crc32:           u32le,
+	comp_size:       u32le,
+	uncomp_size:     u32le,
+	file_name_len:   u16le,
+	extra_field_len: u16le,
 }
 
 MsDosTime :: bit_field u16le {

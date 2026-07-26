@@ -2,7 +2,7 @@ package zip
 
 Reader :: struct {
 	data: []byte,
-	offset: i64
+	offset: i64,
 }
 
 reader_init :: proc(reader: ^Reader, buf: []byte) {
