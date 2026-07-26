@@ -1,99 +1,115 @@
 package zip
 
+import "core:io"
+import "core:bytes"
+import "core:os"
+
 Reader :: struct {
-	data: []byte,
-	offset: i64,
+  f: ^os.File,
+  b: bytes.Reader,
+  r: io.Reader,
+  is_file: bool,
 }
 
-reader_init :: proc(reader: ^Reader, buf: []byte) {
-  reader.offset = 0
-  reader.data = buf
+reader_init_with_file :: proc(reader: ^Reader, file_name: string) -> io.Error {
+  file, file_err := os.open(file_name)
+  reader.f = file
+  reader.is_file = true
+  reader.r = os.to_reader(reader.f)
+
+  return .None
 }
+
+reader_init_with_bytes :: proc(reader: ^Reader, b: []byte) -> io.Error {
+  byte_buf : bytes.Reader
+  reader.b = byte_buf
+  reader.r = bytes.reader_init(&reader.b, b)
+  reader.is_file = false
+
+  return .None
+}
+
+reader_init :: proc{reader_init_with_bytes, reader_init_with_file}
 
 reader_size :: proc(reader: ^Reader) -> i64 {
-  return i64(len(reader.data))
+  size, err := io.size(reader.r)
+  assert(err == io.Error.None)
+  return size
 }
 
 reader_available :: proc(reader: ^Reader) -> i64 {
-  return i64(len(reader.data)) - reader.offset
+  return reader_size(reader) - reader_cursor(reader)
 }
 
-reader_seek :: proc(reader: ^Reader, offset: i64) -> (pos: i64, err: Error) {
+reader_seek :: proc(reader: ^Reader, offset: i64) -> (pos: i64, err: io.Error) {
   if offset < 0 {
-    return -1, .Invalid_Argument
-  }
-
-  if offset > i64(len(reader.data) - 1) {
     return -1, .Invalid_Offset
-  } 
-  // Always seek from start of buffer as relative position
-  reader.offset = offset
-  return i64(reader.offset), .None
+  }
+
+  return io.seek(reader.r, offset, .Start)
 }
 
-reader_read_value :: proc(reader: ^Reader, $T: typeid) -> (value: T, err: Error) {
-  remaining := reader_available(reader)
-  if remaining < size_of(T) {
-    err = .Short_Read
-    return
-  }
-  ptr := raw_data(reader.data[reader.offset:])
+reader_read_value :: proc(reader: ^Reader, $T: typeid) -> (value: T, err: io.Error) {
+  buf := make([]byte, size_of(T), context.temp_allocator)
+  ptr := raw_data(buf)
+  io.read_ptr(reader.r, ptr, size_of(T)) or_return
   value = (^T)(ptr)^
-  reader.offset += size_of(T)
-  return
+  return value, .None
 }
 
-reader_peek_value :: proc(reader: ^Reader, $T: typeid) -> (value: T, err: Error) {
-  remaining := reader_available(reader)
-  if remaining < size_of(T) {
-    err = .Short_Read
-    return
+reader_peek_value :: proc(reader: ^Reader, $T: typeid) -> (value: T, err: io.Error) {
+  restore_seek_pos := reader_cursor(reader)
+  if reader_available(reader) < size_of(T) {
+    return value, .Negative_Read
   }
-  ptr := raw_data(reader.data[reader.offset:])
-  value = (^T)(ptr)^
-  return
+
+  value, err = reader_read_value(reader, T)
+  
+  // Always restore the previous position of the stream
+  reader_seek(reader, restore_seek_pos)
+
+  return value, err
 }
 
 reader_reset_pos :: proc(reader: ^Reader) {
-  reader.offset = 0
+  reader_seek(reader, 0)
 }
 
 reader_cursor :: proc(reader: ^Reader) -> i64 {
-  return reader.offset
+  cur_pos, seek_err := io.seek(reader.r, 0, .Current)
+  assert(seek_err == .None)
+  return cur_pos
 }
 
 // Note: Does not clone the slice
-reader_read_array :: proc(reader: ^Reader, $T: typeid, count: i64) -> (value: []T, err: Error) {
+reader_read_array :: proc(reader: ^Reader, $T: typeid, count: i64) -> (value: []T, err: io.Error) {
   remaining := reader_available(reader)
   if remaining < size_of(T) * count {
-    return value, .Short_Read
+    return value, .Negative_Read
   }
 
-  ptr := raw_data(reader.data[reader.offset:])
-  value = ([^]T)(ptr)[:count]
-  reader.offset += size_of(T) * count
-  return
+  io.read_slice(reader.r, value)
+
+  return value, .None
 }
 
-reader_read_string :: proc(reader: ^Reader, count: i64) -> (value: string, err: Error) {
+reader_read_string :: proc(reader: ^Reader, count: i64) -> (value: string, err: io.Error) {
   buf, arr_err := reader_read_array(reader, byte, count)
   return string(buf), arr_err
 }
 
-reader_skip :: proc(reader: ^Reader, count_in_bytes: i64) -> (err: Error) {
+reader_skip :: proc(reader: ^Reader, count_in_bytes: i64) -> (err: io.Error) {
   if count_in_bytes < 0 {
     return .None
   }
   if reader_available(reader) < count_in_bytes {
-    return .Short_Read
+    return .Negative_Read
   }
 
-  reader.offset += count_in_bytes
+  cur_pos := reader_cursor(reader)
+  cur_pos += count_in_bytes
+  skipped_pos := reader_seek(reader, cur_pos) or_return
+
   return .None
 }
 
-reader_unread :: proc(reader: ^Reader, count_in_bytes: i64) -> (err: Error) {
-  reader.offset -= count_in_bytes
-  reader.offset = min(reader.offset, 0)
-  return .None
-}

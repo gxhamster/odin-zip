@@ -3,6 +3,7 @@ package zip
 import "core:mem"
 import "core:os"
 import "core:time/datetime"
+import "core:io"
 
 ZipArchive :: struct {
 	file:      ^os.File,
@@ -30,7 +31,12 @@ CompressioMethod :: enum u16le {
 	AEX     = 99,
 }
 
-Error :: enum {
+Error :: union {
+	ZipError,
+	io.Error
+}
+
+ZipError :: enum {
 	None,
 
 	// General Errors
@@ -41,13 +47,7 @@ Error :: enum {
 	Datetime_Error,
 	Entry_Not_Found,
 	Deflate_Error,
-
-	// Reader Errors
-	Short_Read,
-	Invalid_Offset,
-	Invalid_EOCD_Signature,
-	EOCD_Signature_Not_Found,
-	Invalid_Comment_Length,
+	EOCD_Not_Found,
 }
 
 Magic :: enum u32le {
@@ -166,3 +166,4 @@ ExtraField :: struct {
 
 U32_MAX :: 0xFFFFFFFF
 U16_MAX :: 0xFFFF
+

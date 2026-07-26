@@ -8,6 +8,16 @@ import "core:strings"
 import "core:time"
 import "core:time/datetime"
 
+
+/*
+	== TODO ==
+	- Register custom methods to read extra fields
+	- Register custom compressor/decompressor
+	- Most common decryption implemented
+	- Multi-part archives
+	- io.Stream compatible reader/writer
+*/
+
 open_from_path :: proc(
 	path: string,
 	mode: os.File_Flags,
@@ -48,7 +58,7 @@ open_from_path :: proc(
 
 	read_metadata(&archive) or_return
 
-	return archive, .None
+	return archive, ZipError.None
 }
 
 
@@ -57,7 +67,7 @@ find_eocd_signature :: proc(archive: ^ZipArchive) -> (offset: i64, ok: bool) {
 	// largest possible size
 	restore_seek_pos := reader_cursor(archive.reader)
 	defer {
-		archive.reader.offset = restore_seek_pos
+		reader_seek(archive.reader, restore_seek_pos)
 	}
 
 	search_ranges := []i64{1024, size_of(_EocdHdr) + size_of(u16le)}
@@ -73,7 +83,7 @@ find_eocd_signature :: proc(archive: ^ZipArchive) -> (offset: i64, ok: bool) {
 		for {
 			possible_magic := reader_peek_value(archive.reader, u32le) or_continue
 			if possible_magic == u32le(Magic.EOCD) {
-				offset = archive.reader.offset
+				offset = reader_cursor(archive.reader)
 				return offset, true
 			} else {
 				reader_skip(archive.reader, 1) or_break
@@ -81,7 +91,6 @@ find_eocd_signature :: proc(archive: ^ZipArchive) -> (offset: i64, ok: bool) {
 		}
 	}
 
-	archive.reader.offset = restore_seek_pos
 	return -1, false
 }
 
@@ -90,7 +99,7 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 	// Properly find the Zip64 eocd and locator and sets the field in struct
 	eocd_offset, ok := find_eocd_signature(archive)
 	if !ok {
-		return .EOCD_Signature_Not_Found
+		return .EOCD_Not_Found
 	}
 
 	reader_seek(archive.reader, eocd_offset) or_return
@@ -187,7 +196,7 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 			}
 
 			extra_field_len := i64(cd_hdr.extra_field_length)
-			extra_field_end_offset := archive.reader.offset + extra_field_len
+			extra_field_end_offset := reader_cursor(archive.reader) + extra_field_len
 
 			for reader_available(archive.reader) > 4 && reader_cursor(archive.reader) < extra_field_end_offset {
 				extra_field_hdr := reader_read_value(archive.reader, Extra_Hdr) or_break
@@ -293,13 +302,13 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 
 	}
 
-	return .None
+	return ZipError.None
 }
 
 stat_by_name :: proc(archive: ^ZipArchive, name: string) -> (entry: ZipEntry, idx: u64, err: Error) {
 	for _entry, i in archive.entries {
 		if _entry.name == name {
-			return _entry, u64(i), .None
+			return _entry, u64(i), ZipError.None
 		}
 	}
 
@@ -311,7 +320,7 @@ stat_by_index :: proc(archive: ^ZipArchive, index: u64) -> (entry: ZipEntry, err
 		return entry, .Entry_Not_Found
 	}
 
-	return archive.entries[index], .None
+	return archive.entries[index], ZipError.None
 }
 
 stat :: proc {
@@ -328,17 +337,17 @@ deflate_decompressor :: proc(input: []u8, allocator: mem.Allocator) -> (out: byt
 		return out, .Deflate_Error
 	}
 
-	return out_buffer, .None
+	return out_buffer, ZipError.None
 }
 
 extract_entry_to_reader :: proc{extract_entry_to_reader_by_name, extract_entry_to_reader_by_index}
 
-extract_entry_to_reader_by_name :: proc(archive: ^ZipArchive, entry_name: string) -> (r: ^Reader, err: Error) {
+extract_entry_to_reader_by_name :: proc(archive: ^ZipArchive, entry_name: string) -> (r: Reader, err: Error) {
 	_, entry_idx := stat_by_name(archive, entry_name) or_return
 	return extract_entry_to_reader_by_index(archive, entry_idx)
 }
 
-extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -> (r: ^Reader, err: Error) {
+extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -> (r: Reader, err: Error) {
 	target_entry := stat_by_index(archive, entry_idx) or_return
 	reader_seek(archive.reader, i64(target_entry.local_offset)) or_return
 	local_file_header := reader_read_value(archive.reader, _LfHdr) or_return
@@ -366,9 +375,9 @@ extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -
 			copy(file_data_cloned, file_data)
 
 			out_buffer := deflate_decompressor(file_data_cloned, archive.allocator) or_return
-			r.data = out_buffer.buf[:]
+			reader_init(&r, out_buffer.buf[:])
 			
-			return r, .None
+			return r, ZipError.None
 		}
 	case .STORE:
 		{
@@ -376,9 +385,9 @@ extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -
 			file_data := reader_read_array(archive.reader, u8, target_entry.uncompressed_size) or_return
 			file_data_cloned := make([]u8, len(file_data), archive.allocator)
 			copy(file_data_cloned, file_data)
-			r.data = file_data_cloned
+			reader_init(&r, file_data_cloned)
 
-			return r, .None
+			return r, ZipError.None
 		}
 	case .AEX:
 		unreachable()
