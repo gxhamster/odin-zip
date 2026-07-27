@@ -13,6 +13,9 @@ Reader :: struct {
 
 reader_init_with_file :: proc(reader: ^Reader, file_name: string) -> io.Error {
   file, file_err := os.open(file_name)
+  if file_err != os.ERROR_NONE {
+    return .Unknown
+  }
   reader.f = file
   reader.is_file = true
   reader.r = os.to_reader(reader.f)
@@ -82,20 +85,35 @@ reader_cursor :: proc(reader: ^Reader) -> i64 {
 }
 
 // Note: Does not clone the slice
-reader_read_array :: proc(reader: ^Reader, $T: typeid, count: i64) -> (value: []T, err: io.Error) {
+// reader_read_array :: proc(reader: ^Reader, $T: typeid, count: i64) -> (value: []T, err: io.Error) {
+//   remaining := reader_available(reader)
+//   if remaining < size_of(T) * count {
+//     return value, .Negative_Read
+//   }
+
+//   io.read_slice(reader.r, value)
+
+//   return value, .None
+// }
+
+reader_read_array :: proc(reader: ^Reader, out: $S/[]$T) -> (err: io.Error) {
   remaining := reader_available(reader)
-  if remaining < size_of(T) * count {
-    return value, .Negative_Read
+  if int(remaining) < len(out) {
+    return .Negative_Read
+  } else {
+    io.read_slice(reader.r, out)
+    return .None
   }
-
-  io.read_slice(reader.r, value)
-
-  return value, .None
 }
 
-reader_read_string :: proc(reader: ^Reader, count: i64) -> (value: string, err: io.Error) {
-  buf, arr_err := reader_read_array(reader, byte, count)
-  return string(buf), arr_err
+// Will allocate string on the `allocator`
+reader_read_string :: proc(reader: ^Reader, count: i64, allocator := context.allocator) -> (value: string, err: io.Error) {
+  u8_buf := make([]u8, count, allocator)
+  arr_err := reader_read_array(reader, u8_buf)
+  if arr_err != .None {
+    return value, arr_err
+  }
+  return string(u8_buf), arr_err
 }
 
 reader_skip :: proc(reader: ^Reader, count_in_bytes: i64) -> (err: io.Error) {
