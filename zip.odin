@@ -92,12 +92,7 @@ recover :: proc(path: string, allocator := context.allocator) -> (archive: ZipAr
 			entry.method = lfh.comp_method
 			entry.local_offset = u64(hdr_offset)
 			mod_datetime_err : datetime.Error
-			entry.modified_datetime, mod_datetime_err  = datetime.components_to_datetime(
-				lfh.mod_date.year, lfh.mod_date.month, lfh.mod_date.day, lfh.mod_time.hour, lfh.mod_time.minute, lfh.mod_time.second
-			)
-			if mod_datetime_err != .None {
-				// Even if date is wrong keep going
-			}
+			entry.modified_datetime = dos_datetime_to_datetime(lfh.mod_date, lfh.mod_time)
 
 			entry.is_directory = strings.ends_with(entry.name, "/") || strings.ends_with(entry.name, "\\")
 			entry.is_encrypted = (lfh.flags & 1) != 0
@@ -217,19 +212,7 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 		entry.local_offset = u64(cd_hdr.local_hdr_offset)
 		entry.crc32 = u32(cd_hdr.crc)
 		entry.method = cd_hdr.compression_method
-		mod_datetime, mod_datetime_err := datetime.components_to_datetime(
-			cd_hdr.last_modified_date.year,
-			cd_hdr.last_modified_date.month,
-			cd_hdr.last_modified_date.day,
-			cd_hdr.last_modified_time.hour,
-			cd_hdr.last_modified_time.minute,
-			cd_hdr.last_modified_time.second,
-		)
-		if mod_datetime_err != .None {
-			break
-		} else {
-			entry.modified_datetime = mod_datetime
-		}
+		entry.modified_datetime = dos_datetime_to_datetime(cd_hdr.last_modified_date, cd_hdr.last_modified_time)
 
 		// note: If these fields are at max good indicator that ZIP64 format is being used
 		is_zip64 :=
@@ -457,4 +440,20 @@ extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -
 
 
 	return r, .Not_Supported
+}
+
+dos_datetime_to_datetime :: proc(date: MsDosDate, time: MsDosTime) -> datetime.DateTime {
+	MS_DOS_YEAR_EPOCH :: 1980
+	
+	new_date, new_date_err := datetime.components_to_datetime(
+		MS_DOS_YEAR_EPOCH + date.year,
+		date.month,
+		date.day,
+		time.hour,
+		time.minute,
+		time.second
+	)
+
+	assert(new_date_err == .None)
+	return new_date
 }
