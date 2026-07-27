@@ -1,12 +1,11 @@
 package zip
 
 import "core:mem"
-import "core:os"
 import "core:time/datetime"
 import "core:io"
 
 ZipArchive :: struct {
-	file:      ^os.File,
+	file:      string,
 	reader:    ^Reader,
 	allocator: mem.Allocator,
 	entries:   [dynamic]ZipEntry,

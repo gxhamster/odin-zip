@@ -36,7 +36,7 @@ open_from_path :: proc(
 
 	defer os.close(file)
 
-	archive.file = file
+	archive.file = path
 	archive.allocator = allocator
 
 	file_size, file_size_err := os.file_size(file)
@@ -57,6 +57,63 @@ open_from_path :: proc(
 	archive.reader = reader
 
 	read_metadata(&archive) or_return
+
+	return archive, ZipError.None
+}
+
+// Tries to look for Local Headers in a archive
+// with missing central directories. Could be potentially slow
+// in large archives
+recover :: proc(path: string, allocator := context.allocator) -> (archive: ZipArchive, err: Error) {
+	archive.allocator = allocator
+
+	reader: ^Reader = new(Reader, archive.allocator)
+	reader_init(reader, path)
+
+	archive.file = path
+	archive.reader = reader
+	archive.entries = make([dynamic]ZipEntry, archive.allocator)
+
+	// Search for the LFH header
+	for {
+		if reader_available(reader) < 4 do break
+
+		magic := reader_peek_value(reader, u32le) or_return
+		if magic == u32le(Magic.LFH) {
+			// Parse the LFH
+			hdr_offset := reader_cursor(reader)
+			lfh := reader_read_value(reader, _LfHdr) or_return
+			file_name := reader_read_string(reader, i64(lfh.file_name_len)) or_break
+			entry : ZipEntry
+			entry.name = file_name
+			entry.compressed_size = i64(lfh.comp_size)
+			entry.uncompressed_size = i64(lfh.uncomp_size)
+			entry.crc32 = u32(lfh.crc32)
+			entry.method = lfh.comp_method
+			entry.local_offset = u64(hdr_offset)
+			mod_datetime_err : datetime.Error
+			entry.modified_datetime, mod_datetime_err  = datetime.components_to_datetime(
+				lfh.mod_date.year, lfh.mod_date.month, lfh.mod_date.day, lfh.mod_time.hour, lfh.mod_time.minute, lfh.mod_time.second
+			)
+			if mod_datetime_err != .None {
+				// Even if date is wrong keep going
+			}
+
+			entry.is_directory = strings.ends_with(entry.name, "/") || strings.ends_with(entry.name, "\\")
+			entry.is_encrypted = (lfh.flags & 1) != 0
+			append(&archive.entries, entry)
+
+			// Skip the file data
+			reader_seek(archive.reader, hdr_offset + entry.compressed_size) or_return
+
+		} else {
+			reader_skip(reader, 1) or_return
+		}
+	}
+
+	if len(archive.entries) == 0 {
+		return archive, .Corrupted_Data
+	}
 
 	return archive, ZipError.None
 }
@@ -120,6 +177,8 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 	}
 
 	num_entries := i64(raw_eocd_hdr.total_central_records)
+	archive.entries = make([dynamic]ZipEntry, 0, num_entries, archive.allocator)
+
 
 	// Check if this zip archive could be a ZIP64 type
 	if raw_eocd_hdr.offset_to_central_directory_start == 0xFFFFFFFF || raw_eocd_hdr.total_central_records == 0xFFFF {
@@ -140,10 +199,13 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 
 	reader_seek(archive.reader, i64(raw_eocd_hdr.offset_to_central_directory_start)) or_return
 
+
 	for i in 0 ..< num_entries {
 		// Read all the central directory entries
 		cd_hdr := reader_read_value(archive.reader, _CdHdr) or_break
-		if cd_hdr.magic != u32le(Magic.CDH) do break
+		if cd_hdr.magic != u32le(Magic.CDH) {
+			return ZipError.Corrupted_Data
+		}
 		file_name_len := i64(cd_hdr.file_name_length)
 		// Note: Need to check if odin strings need to be checked for valid utf-8
 		file_name := reader_read_string(archive.reader, file_name_len) or_break
@@ -198,7 +260,7 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 			extra_field_len := i64(cd_hdr.extra_field_length)
 			extra_field_end_offset := reader_cursor(archive.reader) + extra_field_len
 
-			for reader_available(archive.reader) > 4 && reader_cursor(archive.reader) < extra_field_end_offset {
+			for reader_available(archive.reader) > size_of(Extra_Hdr) && reader_cursor(archive.reader) < extra_field_end_offset {
 				extra_field_hdr := reader_read_value(archive.reader, Extra_Hdr) or_break
 
 				switch extra_field_hdr.id {
@@ -276,8 +338,10 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 				}
 
 			}
-
 		}
+
+		// Skip the comment
+		reader_skip(archive.reader, i64(cd_hdr.file_comment_length)) or_return
 
 		is_dir := strings.ends_with(file_name, "/") || strings.ends_with(file_name, "\\")
 		// If cannot determine from the path alone do a platform-dependent flags checks
@@ -370,11 +434,10 @@ extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -
 	case .DEFLATE:
 		{
 			assert(target_entry.compressed_size < target_entry.uncompressed_size)
-			file_data := reader_read_array(archive.reader, u8, target_entry.compressed_size) or_return
-			file_data_cloned := make([]u8, len(file_data), archive.allocator)
-			copy(file_data_cloned, file_data)
+			file_data := make([]u8, target_entry.compressed_size, archive.allocator)
+			reader_read_array(archive.reader, file_data) or_return
 
-			out_buffer := deflate_decompressor(file_data_cloned, archive.allocator) or_return
+			out_buffer := deflate_decompressor(file_data, archive.allocator) or_return
 			reader_init(&r, out_buffer.buf[:])
 			
 			return r, ZipError.None
@@ -382,10 +445,9 @@ extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -
 	case .STORE:
 		{
 			assert(target_entry.compressed_size == target_entry.uncompressed_size)
-			file_data := reader_read_array(archive.reader, u8, target_entry.uncompressed_size) or_return
-			file_data_cloned := make([]u8, len(file_data), archive.allocator)
-			copy(file_data_cloned, file_data)
-			reader_init(&r, file_data_cloned)
+			file_data := make([]u8, target_entry.uncompressed_size, archive.allocator)
+			reader_read_array(archive.reader, file_data) or_return
+			reader_init(&r, file_data)
 
 			return r, ZipError.None
 		}
