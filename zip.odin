@@ -7,6 +7,8 @@ import "core:os"
 import "core:strings"
 import "core:time"
 import "core:time/datetime"
+import "core:hash"
+import "core:io"
 
 
 /*
@@ -61,6 +63,15 @@ open_from_path :: proc(
 	return archive, ZipError.None
 }
 
+// Frees all the resources related to the zip archive
+close :: proc(archive: ^ZipArchive) {
+	for entry in archive.entries {
+		delete(entry.name)
+	}
+
+	delete_dynamic_array(archive.entries)
+}
+
 // Tries to look for Local Headers in a archive
 // with missing central directories. Could be potentially slow
 // in large archives
@@ -84,14 +95,14 @@ recover :: proc(path: string, allocator := context.allocator) -> (archive: ZipAr
 			hdr_offset := reader_cursor(reader)
 			lfh := reader_read_value(reader, _LfHdr) or_return
 			file_name := reader_read_string(reader, i64(lfh.file_name_len)) or_break
-			entry : ZipEntry
+			entry: ZipEntry
 			entry.name = file_name
 			entry.compressed_size = i64(lfh.comp_size)
 			entry.uncompressed_size = i64(lfh.uncomp_size)
 			entry.crc32 = u32(lfh.crc32)
 			entry.method = lfh.comp_method
 			entry.local_offset = u64(hdr_offset)
-			mod_datetime_err : datetime.Error
+			mod_datetime_err: datetime.Error
 			entry.modified_datetime = dos_datetime_to_datetime(lfh.mod_date, lfh.mod_time)
 
 			entry.is_directory = strings.ends_with(entry.name, "/") || strings.ends_with(entry.name, "\\")
@@ -243,7 +254,8 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 			extra_field_len := i64(cd_hdr.extra_field_length)
 			extra_field_end_offset := reader_cursor(archive.reader) + extra_field_len
 
-			for reader_available(archive.reader) > size_of(Extra_Hdr) && reader_cursor(archive.reader) < extra_field_end_offset {
+			for reader_available(archive.reader) > size_of(Extra_Hdr) &&
+			    reader_cursor(archive.reader) < extra_field_end_offset {
 				extra_field_hdr := reader_read_value(archive.reader, Extra_Hdr) or_break
 
 				switch extra_field_hdr.id {
@@ -352,22 +364,22 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 	return ZipError.None
 }
 
-stat_by_name :: proc(archive: ^ZipArchive, name: string) -> (entry: ZipEntry, idx: u64, err: Error) {
+stat_by_name :: proc(archive: ^ZipArchive, name: string) -> (entry: ZipEntry, idx: u64, err: ZipError) {
 	for _entry, i in archive.entries {
 		if _entry.name == name {
-			return _entry, u64(i), ZipError.None
+			return _entry, u64(i), .None
 		}
 	}
 
 	return entry, idx, .Entry_Not_Found
 }
 
-stat_by_index :: proc(archive: ^ZipArchive, index: u64) -> (entry: ZipEntry, err: Error) {
+stat_by_index :: proc(archive: ^ZipArchive, index: u64) -> (entry: ZipEntry, err: ZipError) {
 	if int(index) > len(archive.entries) - 1 {
 		return entry, .Entry_Not_Found
 	}
 
-	return archive.entries[index], ZipError.None
+	return archive.entries[index], .None
 }
 
 stat :: proc {
@@ -376,7 +388,7 @@ stat :: proc {
 }
 
 
-deflate_decompressor :: proc(input: []u8, allocator: mem.Allocator) -> (out: bytes.Buffer, err: Error) {
+deflate_decompressor :: proc(input: []u8, allocator: mem.Allocator) -> (out: bytes.Buffer, err: ZipError) {
 	out_buffer: bytes.Buffer
 	bytes.buffer_init_allocator(&out_buffer, 0, len(input), allocator)
 	zlib_err := zlib.inflate_from_byte_array_raw(input, &out_buffer)
@@ -387,19 +399,23 @@ deflate_decompressor :: proc(input: []u8, allocator: mem.Allocator) -> (out: byt
 	return out_buffer, ZipError.None
 }
 
-extract_entry_to_reader :: proc{extract_entry_to_reader_by_name, extract_entry_to_reader_by_index}
+// Will allocate a new reader
+extract_entry_to_reader :: proc {
+	extract_entry_to_reader_by_name,
+	extract_entry_to_reader_by_index,
+}
 
-extract_entry_to_reader_by_name :: proc(archive: ^ZipArchive, entry_name: string) -> (r: Reader, err: Error) {
+extract_entry_to_reader_by_name :: proc(archive: ^ZipArchive, entry_name: string) -> (r: ^Reader, err: Error) {
 	_, entry_idx := stat_by_name(archive, entry_name) or_return
 	return extract_entry_to_reader_by_index(archive, entry_idx)
 }
 
-extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -> (r: Reader, err: Error) {
+extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -> (r: ^Reader, err: Error) {
 	target_entry := stat_by_index(archive, entry_idx) or_return
 	reader_seek(archive.reader, i64(target_entry.local_offset)) or_return
 	local_file_header := reader_read_value(archive.reader, _LfHdr) or_return
 	if local_file_header.magic != u32le(Magic.LFH) {
-		return r, .Corrupted_Data
+		return nil, .Corrupted_Data
 	}
 
 	if target_entry.is_encrypted {
@@ -420,9 +436,10 @@ extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -
 			file_data := make([]u8, target_entry.compressed_size, archive.allocator)
 			reader_read_array(archive.reader, file_data) or_return
 
+			r = new(Reader, archive.allocator)
 			out_buffer := deflate_decompressor(file_data, archive.allocator) or_return
-			reader_init(&r, out_buffer.buf[:])
-			
+			reader_init(r, out_buffer.buf[:])
+
 			return r, ZipError.None
 		}
 	case .STORE:
@@ -430,7 +447,9 @@ extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -
 			assert(target_entry.compressed_size == target_entry.uncompressed_size)
 			file_data := make([]u8, target_entry.uncompressed_size, archive.allocator)
 			reader_read_array(archive.reader, file_data) or_return
-			reader_init(&r, file_data)
+			r = new(Reader, archive.allocator)
+
+			reader_init(r, file_data)
 
 			return r, ZipError.None
 		}
@@ -439,21 +458,73 @@ extract_entry_to_reader_by_index :: proc(archive: ^ZipArchive, entry_idx: u64) -
 	}
 
 
-	return r, .Not_Supported
+	return nil, .Not_Supported
 }
 
 dos_datetime_to_datetime :: proc(date: MsDosDate, time: MsDosTime) -> datetime.DateTime {
 	MS_DOS_YEAR_EPOCH :: 1980
-	
+
 	new_date, new_date_err := datetime.components_to_datetime(
 		MS_DOS_YEAR_EPOCH + date.year,
 		date.month,
 		date.day,
 		time.hour,
 		time.minute,
-		time.second
+		time.second,
 	)
 
 	assert(new_date_err == .None)
 	return new_date
+}
+
+is_error :: proc(error: Error) -> bool {
+	switch t in error {
+	case ZipError:
+		{
+			if error.(ZipError) != ZipError.None {
+				return true
+			} else {
+				return false
+			}
+		}
+	case io.Error:
+		{
+			if error.(io.Error) != io.Error.None {
+				return true
+			} else {
+				return false
+			}
+		}
+	}
+
+	return false
+}
+
+// Reads an entire file from the archive
+read_file_all :: proc(
+	archive: ^ZipArchive,
+	allocator: mem.Allocator,
+	name: string,
+	passwd: string,
+) -> (
+	b: []byte,
+	err: Error,
+) {
+	reader, reader_err := extract_entry_to_reader(archive, name)
+	if is_error(reader_err) {
+		return b, reader_err
+	}
+
+	total_data_size := reader_size(reader)
+	b = make([]byte, total_data_size, allocator)
+	reader_read_full(reader, b) or_return
+
+	crc32_hash := hash.crc32(b)
+	entry, _ := stat(archive, name) or_return
+
+	if crc32_hash != entry.crc32 {
+		return b, .Corrupted_Data
+	}
+
+	return b, ZipError.None
 }
