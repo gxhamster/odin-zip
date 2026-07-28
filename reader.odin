@@ -84,18 +84,6 @@ reader_cursor :: proc(reader: ^Reader) -> i64 {
   return cur_pos
 }
 
-// Note: Does not clone the slice
-// reader_read_array :: proc(reader: ^Reader, $T: typeid, count: i64) -> (value: []T, err: io.Error) {
-//   remaining := reader_available(reader)
-//   if remaining < size_of(T) * count {
-//     return value, .Negative_Read
-//   }
-
-//   io.read_slice(reader.r, value)
-
-//   return value, .None
-// }
-
 reader_read_array :: proc(reader: ^Reader, out: $S/[]$T) -> (err: io.Error) {
   remaining := reader_available(reader)
   if int(remaining) < len(out) {
@@ -127,6 +115,15 @@ reader_skip :: proc(reader: ^Reader, count_in_bytes: i64) -> (err: io.Error) {
   cur_pos := reader_cursor(reader)
   cur_pos += count_in_bytes
   skipped_pos := reader_seek(reader, cur_pos) or_return
+
+  return .None
+}
+
+reader_read_full :: proc(reader: ^Reader, out: []byte) -> (err: io.Error) {
+  if i64(len(out)) < reader_size(reader) {
+    return .Short_Buffer
+  }
+  io.read_full(reader.r, out) or_return
 
   return .None
 }
