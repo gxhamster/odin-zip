@@ -1,15 +1,18 @@
 package zip
 
-import "core:mem"
-import "core:time/datetime"
 import "core:io"
+import "core:mem"
+import "core:os"
+import "core:time/datetime"
 
 ZipArchive :: struct {
-	file:      string,
-	reader:    ^Reader,
-	allocator: mem.Allocator,
-	entries:   [dynamic]ZipEntry,
-	comment:   string,
+	file_name:   string,
+	file_handle: ^os.File,
+	reader:      ^Reader,
+	allocator:   mem.Allocator,
+	entries:     [dynamic]ZipEntry,
+	comment:     string,
+	mode:        Mode,
 }
 
 ZipEntry :: struct {
@@ -24,6 +27,11 @@ ZipEntry :: struct {
 	is_encrypted:      bool,
 }
 
+Mode :: enum {
+	Read,
+	Write,
+}
+
 CompressioMethod :: enum u16le {
 	STORE   = 0,
 	DEFLATE = 8,
@@ -32,7 +40,7 @@ CompressioMethod :: enum u16le {
 
 Error :: union {
 	ZipError,
-	io.Error
+	io.Error,
 }
 
 ZipError :: enum {
@@ -165,4 +173,3 @@ ExtraField :: struct {
 
 U32_MAX :: 0xFFFFFFFF
 U16_MAX :: 0xFFFF
-

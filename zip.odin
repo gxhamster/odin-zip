@@ -22,23 +22,35 @@ import "core:io"
 
 open_from_path :: proc(
 	path: string,
-	mode: os.File_Flags,
+	mode: Mode,
 	allocator := context.allocator,
 ) -> (
-	archive: ZipArchive,
+	archive: ^ZipArchive,
 	err: Error,
 ) {
 	if !os.exists(path) {
 		return archive, .OS_Error
 	}
-	file, file_err := os.open(path, mode)
+
+	archive = new(ZipArchive, allocator)
+	
+	file : ^os.File
+	file_err: os.Error
+	switch mode {
+	case .Read:
+		file, file_err = os.open(path, {.Read})
+		archive.mode = .Read	
+	case .Write:
+		file, file_err = os.open(path, {.Write, .Read})
+		archive.mode = .Write
+	}
+
 	if file_err != os.ERROR_NONE {
 		return archive, .OS_Error
 	}
 
-	defer os.close(file)
-
-	archive.file = path
+	archive.file_handle = file
+	archive.file_name = path
 	archive.allocator = allocator
 
 	file_size, file_size_err := os.file_size(file)
@@ -58,7 +70,10 @@ open_from_path :: proc(
 	reader_init(reader, file_data)
 	archive.reader = reader
 
-	read_metadata(&archive) or_return
+	meta_err := read_metadata(archive)
+	if is_error(meta_err) {
+		return nil, meta_err
+	}
 
 	return archive, ZipError.None
 }
@@ -70,6 +85,9 @@ close :: proc(archive: ^ZipArchive) {
 	}
 
 	delete_dynamic_array(archive.entries)
+	defer os.close(archive.file_handle)
+	ptr := rawptr(archive)
+	free(ptr, archive.allocator)
 }
 
 // Tries to look for Local Headers in a archive
@@ -81,7 +99,7 @@ recover :: proc(path: string, allocator := context.allocator) -> (archive: ZipAr
 	reader: ^Reader = new(Reader, archive.allocator)
 	reader_init(reader, path)
 
-	archive.file = path
+	archive.file_name = path
 	archive.reader = reader
 	archive.entries = make([dynamic]ZipEntry, archive.allocator)
 
