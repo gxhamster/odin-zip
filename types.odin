@@ -5,10 +5,13 @@ import "core:mem"
 import "core:os"
 import "core:time/datetime"
 
+ZIP_VERSION :: 20
+
 ZipArchive :: struct {
 	file_name:   string,
 	file_handle: ^os.File,
 	reader:      ^Reader,
+	writer:      ^Writer,
 	allocator:   mem.Allocator,
 	entries:     [dynamic]ZipEntry,
 	comment:     string,
@@ -19,13 +22,38 @@ ZipEntry :: struct {
 	name:              string,
 	compressed_size:   i64,
 	uncompressed_size: i64,
-	local_offset:      u64,
+	local_offset:      u64, // Starting offset of LFH
 	modified_datetime: datetime.DateTime,
+  flags:             GeneralFlags,
 	crc32:             u32,
 	method:            CompressioMethod,
 	is_directory:      bool,
 	is_encrypted:      bool,
 }
+
+GeneralFlag :: enum {
+	Encrypted           = 0, // indicates that the file is encrypted
+	Imploding_Bit1      = 1, // indicates an 8K sliding dictionary was used
+	Imploding_Bit2      = 2, // indicates 3 Shannon-Fano trees were used to encode the sliding dictionary output
+	Deflating_Bit1      = 1,
+	Deflating_Bit2      = 2,
+	LZMA_EOS_Marker     = 1, // indicates an end-of-stream (EOS) marker is used to mark the end of the compressed data stream
+	Data_Descriptor     = 3,
+	Enchanced_Deflating = 4,
+	Patched_Data        = 5, // If this bit is set, this indicates that the file is  compressed patched data.
+	Strong_Encryption   = 6,
+	Unused1             = 7,
+	Unused2             = 8,
+	Unused3             = 9,
+	Unused4             = 10,
+	Utf8                = 11,
+	Reserved1           = 12,
+	Masked              = 13,
+	Reserved2           = 14,
+	Reserved3           = 15,
+}
+
+GeneralFlags :: bit_set[GeneralFlag; u16le]
 
 Mode :: enum {
 	Read,
@@ -55,6 +83,7 @@ ZipError :: enum {
 	Entry_Not_Found,
 	Deflate_Error,
 	EOCD_Not_Found,
+	Copy_Error,
 }
 
 Magic :: enum u32le {
@@ -169,6 +198,13 @@ ExtraField :: struct {
 	id:   ExtraFieldType,
 	size: u64,
 	data: []u8,
+}
+
+@(private)
+DataDescriptor :: struct #packed {
+  crc32: u32le,
+  comp_size: u32le,
+  uncomp_size: u32le
 }
 
 U32_MAX :: 0xFFFFFFFF

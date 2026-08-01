@@ -7,7 +7,7 @@ import "core:os"
 Reader :: struct {
   f: ^os.File,
   b: bytes.Reader,
-  r: io.Reader,
+  s: io.Stream,
   is_file: bool,
 }
 
@@ -18,15 +18,23 @@ reader_init_with_file :: proc(reader: ^Reader, file_name: string) -> io.Error {
   }
   reader.f = file
   reader.is_file = true
-  reader.r = os.to_reader(reader.f)
+  reader.s = os.to_reader(reader.f)
 
   return .None
+}
+
+reader_close :: proc(reader: ^Reader) {
+  if reader.is_file {
+    os.close(reader.f)
+  } else {
+    reader.b = {}
+  }
 }
 
 reader_init_with_bytes :: proc(reader: ^Reader, b: []byte) -> io.Error {
   byte_buf : bytes.Reader
   reader.b = byte_buf
-  reader.r = bytes.reader_init(&reader.b, b)
+  reader.s = bytes.reader_init(&reader.b, b)
   reader.is_file = false
 
   return .None
@@ -35,7 +43,7 @@ reader_init_with_bytes :: proc(reader: ^Reader, b: []byte) -> io.Error {
 reader_init :: proc{reader_init_with_bytes, reader_init_with_file}
 
 reader_size :: proc(reader: ^Reader) -> i64 {
-  size, err := io.size(reader.r)
+  size, err := io.size(reader.s)
   assert(err == io.Error.None)
   return size
 }
@@ -49,13 +57,13 @@ reader_seek :: proc(reader: ^Reader, offset: i64) -> (pos: i64, err: io.Error) {
     return -1, .Invalid_Offset
   }
 
-  return io.seek(reader.r, offset, .Start)
+  return io.seek(reader.s, offset, .Start)
 }
 
 reader_read_value :: proc(reader: ^Reader, $T: typeid) -> (value: T, err: io.Error) {
   buf := make([]byte, size_of(T), context.temp_allocator)
   ptr := raw_data(buf)
-  io.read_ptr(reader.r, ptr, size_of(T)) or_return
+  io.read_ptr(reader.s, ptr, size_of(T)) or_return
   value = (^T)(ptr)^
   return value, .None
 }
@@ -79,7 +87,7 @@ reader_reset_pos :: proc(reader: ^Reader) {
 }
 
 reader_cursor :: proc(reader: ^Reader) -> i64 {
-  cur_pos, seek_err := io.seek(reader.r, 0, .Current)
+  cur_pos, seek_err := io.seek(reader.s, 0, .Current)
   assert(seek_err == .None)
   return cur_pos
 }
@@ -89,7 +97,7 @@ reader_read_array :: proc(reader: ^Reader, out: $S/[]$T) -> (err: io.Error) {
   if int(remaining) < len(out) {
     return .Negative_Read
   } else {
-    io.read_slice(reader.r, out)
+    io.read_slice(reader.s, out)
     return .None
   }
 }
@@ -123,7 +131,7 @@ reader_read_full :: proc(reader: ^Reader, out: []byte) -> (err: io.Error) {
   if i64(len(out)) < reader_size(reader) {
     return .Short_Buffer
   }
-  io.read_full(reader.r, out) or_return
+  io.read_full(reader.s, out) or_return
 
   return .None
 }

@@ -32,7 +32,7 @@ open_from_path :: proc(
 		return archive, .OS_Error
 	}
 
-	archive = new(ZipArchive, allocator)
+archive = new(ZipArchive, allocator)
 	
 	file : ^os.File
 	file_err: os.Error
@@ -93,7 +93,8 @@ close :: proc(archive: ^ZipArchive) {
 // Tries to look for Local Headers in a archive
 // with missing central directories. Could be potentially slow
 // in large archives
-recover :: proc(path: string, allocator := context.allocator) -> (archive: ZipArchive, err: Error) {
+recover :: proc(path: string, allocator := context.allocator) -> (archive: ^ZipArchive, err: Error) {
+	archive = new(ZipArchive, allocator)
 	archive.allocator = allocator
 
 	reader: ^Reader = new(Reader, archive.allocator)
@@ -128,6 +129,7 @@ recover :: proc(path: string, allocator := context.allocator) -> (archive: ZipAr
 			append(&archive.entries, entry)
 
 			// Skip the file data
+      // BUG: Skip the extra fields too
 			reader_seek(archive.reader, hdr_offset + entry.compressed_size) or_return
 
 		} else {
@@ -173,6 +175,47 @@ find_eocd_signature :: proc(archive: ^ZipArchive) -> (offset: i64, ok: bool) {
 	}
 
 	return -1, false
+}
+
+
+// Gets the offset to the the compressed data for the entry
+compute_data_offset_of_entry :: proc(archive: ^ZipArchive, entry: ZipEntry) -> i64 {
+
+  defer {
+    cur_cursor := reader_cursor(archive.reader)
+    reader_seek(archive.reader, cur_cursor)
+  }
+
+  if pos, err := reader_seek(archive.reader, i64(entry.local_offset)); err != .None {
+    return -1
+  }
+  
+  lfh : _LfHdr
+  lfh_err : io.Error
+  if lfh, lfh_err = reader_read_value(archive.reader, _LfHdr); lfh_err != .None {
+    return -1
+  }
+
+  if lfh.magic != u32le(Magic.LFH) {
+    return -1
+  }
+  
+  data_offset := i64(entry.local_offset)
+  data_offset += i64(lfh.file_name_len + lfh.extra_field_len)
+  // TODO: Later need to be aware of encryption headers
+  // data descriptors
+  ZIP_CRYPT_HDR_SIZE :: 12
+  if entry.is_encrypted {
+   // AES encryption header is within the extra field. So no need
+   // to have extra offset arithmetic 
+    if .Strong_Encryption not_in entry.flags {
+      // Traditional PKWARE encryption (ZipCrypto)
+      // has 12 byte header preceding the file data
+      data_offset += ZIP_CRYPT_HDR_SIZE
+    }
+  }
+
+  return data_offset
 }
 
 // Reads all the directory information inside the zip archive and collect the entries
@@ -240,6 +283,7 @@ read_metadata :: proc(archive: ^ZipArchive) -> (err: Error) {
 		entry.uncompressed_size = i64(cd_hdr.uncompressed_size)
 		entry.local_offset = u64(cd_hdr.local_hdr_offset)
 		entry.crc32 = u32(cd_hdr.crc)
+    entry.flags = transmute(GeneralFlags)cd_hdr.flag
 		entry.method = cd_hdr.compression_method
 		entry.modified_datetime = dos_datetime_to_datetime(cd_hdr.last_modified_date, cd_hdr.last_modified_time)
 
@@ -417,7 +461,7 @@ deflate_decompressor :: proc(input: []u8, allocator: mem.Allocator) -> (out: byt
 	return out_buffer, ZipError.None
 }
 
-// Will allocate a new reader
+// Opens a newly allocated reader for an entry in the archive
 extract_entry_to_reader :: proc {
 	extract_entry_to_reader_by_name,
 	extract_entry_to_reader_by_index,
@@ -546,3 +590,91 @@ read_file_all :: proc(
 
 	return b, ZipError.None
 }
+
+
+MS_DOS_EPOCH_YEAR :: 1980
+datetime_to_dos_date_time :: proc(dt: datetime.DateTime) -> (MsDosDate, MsDosTime) {
+	time: MsDosTime = {
+		hour = u32le(dt.hour),
+		minute = u32le(dt.minute),
+		second = u32le(dt.second),
+	}
+	date: MsDosDate = {
+		day = u32le(dt.day),
+		month = u32le(dt.month)
+	}
+	assert(dt.year >= MS_DOS_EPOCH_YEAR, "MsDOS year should be between 1980 - 2099 inclusive")
+	dos_year := dt.year - MS_DOS_EPOCH_YEAR
+	SEVEN_BITS_MAX ::  127
+	assert(dos_year > SEVEN_BITS_MAX, "DOS year is not appropriate size")
+	date.year = u32le(dos_year)
+
+	return date, time
+}
+
+
+// Reads the data from a file on disk and adds the data into
+// the archive along with the directory entry. Will always add the
+// file data and the local file header right after the latest entry
+// int the archive.
+add_file_entry_to_archive :: proc(archive: ^ZipArchive, file_name: string, method: CompressioMethod) -> Error {
+	reader := new(Reader, archive.allocator)
+	reader_init(reader, file_name)
+	
+	cur_time := time.now()
+	cur_datetime, cur_datetime_ok := time.time_to_datetime(cur_time)
+	assert(cur_datetime_ok == true)
+
+	reader_data := make([]byte, reader_size(reader), context.temp_allocator) 
+	reader_read_full(reader, reader_data)
+	data_crc32 := hash.crc32(reader_data)
+
+	dos_date, dos_time := datetime_to_dos_date_time(cur_datetime)
+	general_flags : GeneralFlags = {.Utf8}
+	lfh : _LfHdr = {
+		magic = u32le(Magic.LFH),
+		comp_method = method,
+		file_name_len = u16le(len(file_name)),
+		mod_date = dos_date,
+		mod_time = dos_time,
+		flags = transmute(u16le)general_flags,
+		version_needed = ZIP_VERSION, // TODO: Version needed must change with features used (AES, compression applied, etc.)
+		crc32 = u32le(data_crc32),
+		extra_field_len = 0,
+	}
+	next_lfh_loc : u64 = 0
+	if len(archive.entries) > 0 {
+		// Locates the location for the new LFH of the file
+		max_offset : u64 = 0 
+		max_entry : ZipEntry
+		for entry, entry_idx in archive.entries {
+			if entry.local_offset > max_offset {
+				max_offset = entry.local_offset
+        max_entry = entry
+			}
+		}
+    max_entry_data_offset := compute_data_offset_of_entry(archive, max_entry)
+		assert(max_entry_data_offset != -1, "cannot compute data offset of last entry")
+    if .Data_Descriptor in max_entry.flags {
+      next_lfh_loc = u64(max_entry_data_offset) + size_of(DataDescriptor)       
+    }
+	}
+
+	// TODO: Need to support proper compression later
+	if method != .STORE {
+		return ZipError.Not_Supported
+	}
+
+	// We dont want to overlap with any existing entries in the archive
+	// Inserting to the end of the entries ensure that rest of the entries
+	// local offsets does not need to be changed
+	writer_seek(archive.writer, i64(next_lfh_loc)) or_return
+	writer_write_value(archive.writer, _LfHdr, &lfh) or_return
+	copied_bytes := io.copy(archive.writer.s, reader.s) or_return
+	if copied_bytes != reader_size(reader) {
+		return ZipError.Copy_Error
+	}
+
+
+	return ZipError.None
+} 
